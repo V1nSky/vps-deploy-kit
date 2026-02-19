@@ -1,0 +1,64 @@
+version: '3.8'
+
+# docker-compose.template.yml
+# Скопируйте в свой проект как docker-compose.yml
+# Настройте под свой стек
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"     # Для Node.js
+      # - "8000:8000"   # Для Python
+    env_file:
+      - .env
+    volumes:
+      - app-data:/app/data
+      - app-logs:/app/logs
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Раскомментировать если нужна база данных
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: app-db
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: ${DB_NAME}
+  #     POSTGRES_USER: ${DB_USER}
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD}
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   networks:
+  #     - app-network
+
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: app-redis
+  #   restart: unless-stopped
+  #   networks:
+  #     - app-network
+
+volumes:
+  app-data:
+  app-logs:
+  # postgres-data:
+
+networks:
+  app-network:
+    driver: bridge

@@ -1,0 +1,66 @@
+name: 🔙 Manual Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      container_name:
+        description: 'Container name to rollback'
+        required: true
+        default: 'app-nodejs'
+      environment:
+        description: 'Environment (production/staging)'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  rollback:
+    name: 🔙 Rollback
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🔐 Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: 🔙 Execute rollback
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} bash << 'EOF'
+            CONTAINER="${{ github.event.inputs.container_name }}"
+            ROLLBACK_IMAGE=$(cat /tmp/${CONTAINER}_rollback 2>/dev/null || echo "")
+
+            if [ -z "$ROLLBACK_IMAGE" ]; then
+              echo "❌ No rollback point found for $CONTAINER"
+              exit 1
+            fi
+
+            echo "Rolling back $CONTAINER to: $ROLLBACK_IMAGE"
+
+            docker stop $CONTAINER 2>/dev/null || true
+            docker rm $CONTAINER 2>/dev/null || true
+
+            docker run -d \
+              --name $CONTAINER \
+              --restart unless-stopped \
+              $ROLLBACK_IMAGE
+
+            echo "✅ Rollback complete!"
+          EOF
+
+      - name: 🔔 Notify rollback
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            🔙 *Ручной откат выполнен!*
+            
+            📦 Контейнер: `${{ github.event.inputs.container_name }}`
+            🌍 Окружение: `${{ github.event.inputs.environment }}`
+            👤 Инициатор: `${{ github.actor }}`

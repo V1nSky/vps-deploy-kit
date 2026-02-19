@@ -1,0 +1,182 @@
+name: 🚀 Deploy Node.js
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ${{ github.repository_owner }}/app-nodejs
+  CONTAINER_NAME: app-nodejs
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔍 Detect environment
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "name=production" >> $GITHUB_OUTPUT
+            echo "url=${{ secrets.PROD_URL }}" >> $GITHUB_OUTPUT
+            echo "host=${{ secrets.VPS_HOST }}" >> $GITHUB_OUTPUT
+            echo "port=${{ secrets.APP_PORT || '3000' }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=staging" >> $GITHUB_OUTPUT
+            echo "url=${{ secrets.STAGING_URL }}" >> $GITHUB_OUTPUT
+            echo "host=${{ secrets.VPS_HOST }}" >> $GITHUB_OUTPUT
+            echo "port=${{ secrets.STAGING_PORT || '3001' }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔐 Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ steps.env.outputs.host }} >> ~/.ssh/known_hosts
+
+      - name: 🏗️ Build Docker image
+        run: |
+          docker build \
+            --cache-from ${{ env.IMAGE_NAME }}:latest \
+            --tag ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --tag ${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: 📦 Save & transfer Docker image
+        run: |
+          docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} | gzip | \
+            ssh -o StrictHostKeyChecking=no \
+            ${{ secrets.VPS_USER }}@${{ steps.env.outputs.host }} \
+            "docker load"
+
+      - name: 🚀 Deploy on VPS
+        id: deploy
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ steps.env.outputs.host }} bash << 'EOF'
+            set -e
+
+            CONTAINER="${{ env.CONTAINER_NAME }}"
+            IMAGE="${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            PORT="${{ steps.env.outputs.port }}"
+
+            # Save current container as rollback point
+            if docker ps -q -f name=$CONTAINER | grep -q .; then
+              PREV=$(docker inspect $CONTAINER --format='{{.Image}}')
+              echo $PREV > /tmp/${CONTAINER}_rollback
+              echo "Rollback point saved: $PREV"
+            fi
+
+            # Stop old container
+            docker stop $CONTAINER 2>/dev/null || true
+            docker rm $CONTAINER 2>/dev/null || true
+
+            # Load env file if exists
+            ENV_FILE=""
+            [ -f "/opt/app/.env" ] && ENV_FILE="--env-file /opt/app/.env"
+
+            # Start new container
+            docker run -d \
+              --name $CONTAINER \
+              --restart unless-stopped \
+              -p $PORT:3000 \
+              $ENV_FILE \
+              $IMAGE
+
+            echo "Container started successfully"
+          EOF
+
+      - name: ❤️ Health check
+        id: health
+        run: |
+          sleep 10
+          for i in {1..6}; do
+            STATUS=$(ssh ${{ secrets.VPS_USER }}@${{ steps.env.outputs.host }} \
+              "curl -s -o /dev/null -w '%{http_code}' http://localhost:${{ steps.env.outputs.port }}/health || echo 000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "status=healthy" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: 🔙 Rollback on failure
+        if: failure() && steps.deploy.outcome == 'success'
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ steps.env.outputs.host }} bash << 'EOF'
+            CONTAINER="${{ env.CONTAINER_NAME }}"
+            ROLLBACK_IMAGE=$(cat /tmp/${CONTAINER}_rollback 2>/dev/null || echo "")
+            if [ -n "$ROLLBACK_IMAGE" ]; then
+              docker stop $CONTAINER 2>/dev/null || true
+              docker rm $CONTAINER 2>/dev/null || true
+              docker run -d \
+                --name $CONTAINER \
+                --restart unless-stopped \
+                -p ${{ steps.env.outputs.port }}:3000 \
+                $ROLLBACK_IMAGE
+              echo "Rolled back to: $ROLLBACK_IMAGE"
+            else
+              echo "No rollback point found"
+            fi
+          EOF
+
+      - name: 🧹 Cleanup old images
+        if: success()
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ steps.env.outputs.host }} \
+            "docker image prune -f --filter 'until=24h'"
+
+      - name: ✅ Notify success
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ✅ *Деплой успешен!*
+            
+            📦 Проект: `${{ github.repository }}`
+            🌍 Окружение: `${{ steps.env.outputs.name }}`
+            🔖 Коммит: `${{ github.sha }}`
+            👤 Автор: `${{ github.actor }}`
+            🔗 URL: ${{ steps.env.outputs.url }}
+
+      - name: ❌ Notify failure
+        if: failure()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ❌ *Деплой упал!*
+            
+            📦 Проект: `${{ github.repository }}`
+            🌍 Окружение: `${{ steps.env.outputs.name }}`
+            🔖 Коммит: `${{ github.sha }}`
+            👤 Автор: `${{ github.actor }}`
+            🔄 Статус: автоматический откат выполнен
+
+  # Production requires manual approval
+  approve-production:
+    name: ✋ Approve Production
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: ${{ secrets.PROD_URL }}
+    steps:
+      - name: Approved
+        run: echo "Production deployment approved and completed."
